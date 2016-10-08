@@ -2,11 +2,6 @@
 # -*- coding: utf-8 -*-
 from __future__ import division
 
-import gevent
-from gevent import monkey; monkey.patch_all()
-from gevent.queue import PriorityQueue, Queue, Empty
-from gevent import subprocess
-
 import os
 import platform
 import time
@@ -25,6 +20,7 @@ import stat
 import signal
 import logging
 import argparse
+import subprocess
 from array import array
 from SimpleXMLRPCServer import SimpleXMLRPCServer
 
@@ -32,76 +28,12 @@ import psutil
 import netifaces
 
 
-__version__ = '2.9.0'
-
-
-# **********************************************************************************
-# 配置
-# **********************************************************************************
-
-MARMOT_HOST = '192.168.162.91'
-# MARMOT_HOST = '172.16.20.48'
-MARMOT_PORT = 8100
-
-IFNAME = 'eth0'
-
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-SCRIPTS_DIR = os.path.join(BASE_DIR, 'scripts')
-if not os.path.exists(SCRIPTS_DIR):
-    os.mkdir(SCRIPTS_DIR)
-
-ICE_PROJECT_DIR = '/tmp'
-TOMCAT_DIR = '/tmp'
-
-
-logger = logging.Logger('marmot-agent')
-LOG_File = 'marmot-agent.log'
-
-REDIS_LOG_URL = 'http://%s:%s/redis-log/' % (MARMOT_HOST, MARMOT_PORT)
-CONF_URL = 'http://%s:%s/assets/server/conf/' % (MARMOT_HOST, MARMOT_PORT)
-PROCESS_MONITOR_URL = 'http://%s:%s/assets/server/process-monitors/' % (MARMOT_HOST, MARMOT_PORT)
-ALARM_URL = 'http://%s:%s/alarm/' % (MARMOT_HOST, MARMOT_PORT)
-
-DEFAULT_CONF = {
-    'monitor': {
-        'enabled': False,
-        'cpu': 99.0,
-        'memory': 80,
-        'disk': 90,
-        'alarm_interval': 20,
-    }
-}
+__version__ = '0.0.1'
 
 
 # **********************************************************************************
 # 获取机器的静态信息
 # **********************************************************************************
-
-SYSTEM_PATTERN = re.compile(
-    r'System Information\n\tManufacturer: (?P<manufacturer>.*)\n'
-    r'\tProduct Name: (?P<product_name>.*)\n'
-    r'\tVersion: (?P<version>.*)\n'
-    r'\tSerial Number: (?P<serial_number>.*)\n'
-    r'\tUUID: (?P<uuid>.*)\n'
-    r'\t(.)*\n'
-    r'\t(.)*\n'
-    r'\tFamily: (?P<family>.*)\n'
-)
-
-
-def dmidecode_system():
-    content = subprocess.check_output(['sudo', 'dmidecode'])
-    match = re.search(SYSTEM_PATTERN, content)
-    return {
-        'manufacturer': match.group('manufacturer'),
-        'product-name': match.group('product_name'),
-        'version': match.group('version'),
-        'serial-number': match.group('serial_number'),
-        'uuid': match.group('uuid'),
-        'family:': match.group('family'),
-    }
-
 
 VENDOR_PATTERN = re.compile(r'vendor_id([ \t])+: (?P<vendor_id>.*)\n')
 MODEL_PATTERN = re.compile(r'model name([ \t])+: (?P<model_name>.*)\n')
@@ -123,7 +55,7 @@ def get_hwaddr(ifname):
     return ':'.join(['%02x' % ord(char) for char in info[18:24]])
 
 
-def netcard_info():
+def netcard():
     interfaces = netifaces.interfaces()
     if 'lo' in interfaces:
         interfaces.remove('lo')
@@ -149,14 +81,6 @@ def socket_constants(prefix):
 
 SOCKET_FAMILIES = socket_constants('AF_')
 SOCKET_TYPES = socket_constants('SOCK_')
-
-
-def get_local_ip(ifname='eth0'):
-    addrs = {}
-    for iface_name in netifaces.interfaces():
-        addresses = [i['addr'] for i in netifaces.ifaddresses(iface_name).setdefault(netifaces.AF_INET, [{'addr': None}])]
-        addrs[iface_name] = addresses[0]
-    return addrs[ifname]
 
 
 def base_info():
@@ -387,29 +311,6 @@ class Buffer(object):
         return sum(self._items)
 
 
-class Alarm(object):
-    """
-    level: 1(一般), 2(中级), 3(严重)
-    type: cpu, memory, disk, port, process
-    """
-    def __init__(self, host, type_, msg, level=1):
-        self.host = host
-        self.level = level
-        self.type = type_
-        self.msg = msg
-
-    def message(self):
-        return {
-            'host': self.host,
-            'level': self.level,
-            'type': self.type,
-            'msg': self.msg,
-        }
-
-    def __str__(self):
-        return str(self.message())
-
-
 class Actor(gevent.Greenlet):
 
     def __init__(self, interval):
@@ -450,188 +351,6 @@ class Actor(gevent.Greenlet):
 
     def shutdown(self):
         self._inbox.put('shutdown')
-
-
-class BaseMonitor(Actor):
-    alarm_url = ALARM_URL
-
-    def __init__(self, host, name=None, work_interval=5, alarm_interval=20):
-        """
-        work_interval: Second
-        alarm_interval: Minutes
-        """
-        super(BaseMonitor, self).__init__(work_interval)
-        self.host = host
-        self.name = name or self.__class__.__name__
-        self.alarm_countor = 0
-        self.alarm_timer = Timer(60*alarm_interval)
-
-    def reset_alarm_countor(self):
-        self.alarm_countor = 0
-
-    def increase_alarm_countor(self):
-        self.alarm_countor += 1
-
-    def set_alarm_interval(self, interval):
-        """ interval: Minutes """
-        self.alarm_timer.set_interval(60*interval)
-
-    def _send_alarm(self, alarm):
-        logger.info('%s: send alarm %s' % (self.name, alarm.message()))
-        url = self.alarm_url + '?' + urllib.urlencode(alarm.message())
-        req = urllib2.Request(url)
-        res = urllib2.urlopen(req)
-        return json.loads(res.read())
-
-    def get_alarm(self):
-        raise NotImplementedError
-
-    def work(self):
-        logger.debug('%s is running...' % self.name)
-        alarm = self.get_alarm()
-        if alarm:
-            if self.alarm_countor:
-                if self.alarm_timer.done():
-                    self._send_alarm(alarm)
-                    self.alarm_timer.reset()
-            else:
-                self._send_alarm(alarm)
-                self.increase_alarm_countor()
-                self.alarm_timer.reset()
-        else:
-            self.alarm_timer.reset()
-            self.reset_alarm_countor()
-
-
-class ProcessMonitor(BaseMonitor):
-    process_monitor_url = PROCESS_MONITOR_URL
-
-    def __init__(self, host, alarm_interval=20):
-        super(ProcessMonitor, self).__init__(host, work_interval=10, alarm_interval=alarm_interval)
-
-    @staticmethod
-    def check_process(process):
-        for p in psutil.process_iter():
-            if process in ''.join(p.cmdline()):
-                return True
-        return False
-
-    def _get_process_monitors(self):
-        url = self.process_monitor_url + '?' + urllib.urlencode({'ip': self.host})
-        req = urllib2.Request(url)
-        res = urllib2.urlopen(req)
-        return json.loads(res.read())['monitors']
-
-    def get_alarm(self):
-        try:
-            monitors = self._get_process_monitors()
-        except IOError:
-            return
-        if not monitors:
-            return
-        listening_ports = listening_port_set()
-        for monitor in monitors:
-            if not self.check_process(monitor['cmd']):
-                return Alarm(
-                    self.host, 'process',
-                    '{0} - {1}: {2} - 进程: {3}未存活'.format(self.host, self.name, monitor['name'], monitor['process']),
-                    level=3
-                )
-            if monitor['port'] not in listening_ports:
-                return Alarm(
-                    self.host, 'port',
-                    '{0} - {1}: {2} - 端口: {3}未被占用'.format(self.host, self.name, monitor['name'], monitor['port']),
-                    level=3
-                )
-
-
-class CpuMonitor(BaseMonitor):
-    """
-    Cpu负载监视器
-    """
-    def __init__(self, host, alarm_interval=20):
-        super(CpuMonitor, self).__init__(host, work_interval=2, alarm_interval=alarm_interval)
-        # 监控Actor的interval是2second, 这里缓冲1小时的数据, 即1800个数据
-        self._buf = Buffer(1800)
-
-    def load_avg(self):
-        self._buf.append(psutil.cpu_percent())  # 刷新缓冲
-        return {
-            'avg10': self._buf.xmean(10 * 30),
-            'avg30': self._buf.xmean(30 * 30),
-            'avg60': self._buf.xmean(60 * 30),
-        }
-
-    def get_alarm(self):
-        avg = self.load_avg()
-        if avg['avg60'] >= 99.0:
-            return Alarm(self.host, 'cpu', '{0} - {1}: Cpu负载已经持续1小时超过99%'.format(self.host, self.name), level=3)
-        if avg['avg30'] >= 99.0:
-            return Alarm(self.host, 'cpu', '{0} - {1}: Cpu负载已经持续30分钟超过99%'.format(self.host, self.name), level=2)
-        if avg['avg10'] >= 99.0:
-            return Alarm(self.host, 'cpu', '{0} - {1}: Cpu负载已经持续10分钟超过99%'.format(self.host, self.name), level=1)
-
-
-class MemoryMonitor(BaseMonitor):
-    """
-    Memory监视器
-    """
-    def __init__(self, host, level=80, alarm_interval=20):
-        super(MemoryMonitor, self).__init__(host, alarm_interval=alarm_interval)
-        self._alarm_level = level
-        self._buf = Buffer(6)
-
-    def set_alarm_level(self, level):
-        self._alarm_level = level
-
-    def get_alarm(self):
-        self._buf.append(psutil.virtual_memory().percent)
-        used = self._buf.mean()
-        if used >= self._alarm_level:
-            return Alarm(self.host, 'memory', '{0} - {1}: 内存占用: {2}%'.format(self.host, self.name, used), level=2)
-
-
-class DiskMonitor(MemoryMonitor):
-    """
-    Disk监视器
-    """
-    def get_alarm(self):
-        for disk in disks():
-            if disk['percent'] >= self._alarm_level:
-                return Alarm(
-                    self.host, 'disk',
-                    '{0} - {1}: 挂载点: {2}, 使用: {3}%'.format(self.host, self.name, disk['mountpoint'], disk['percent']),
-                    level=2
-                )
-
-
-class PortMonitor(BaseMonitor):
-    """
-    Port监视器
-    """
-    def __init__(self, host, alarm_interval=20):
-        super(PortMonitor, self).__init__(host, alarm_interval=alarm_interval)
-        self.allow_ports = set()  # 监听的端口
-        self.deny_ports = set()  # 开放的端口 - 不允许被占用
-
-    def set_allow_ports(self, ports):
-        self.allow_ports = set(ports)
-
-    def set_deny_ports(self, ports):
-        self.deny_ports = set(ports)
-
-    def get_alarm(self):
-        listening_ports = listening_port_set()
-
-        if self.allow_ports:
-            if not (self.allow_ports < listening_ports):
-                not_ports = self.allow_ports - listening_ports  # 监控端口列表中,没有被listen的端口
-                return Alarm(self.host, 'port', '{0}: 监听端口{1}没有被监听'.format(self.host, not_ports), level=2)
-
-        if self.deny_ports:
-            tmp = self.deny_ports & listening_ports
-            if tmp:
-                return Alarm(self.host, 'port', '{0}: 开放端口{1}被占用'.format(self.host, tmp), level=1)
 
 
 # **********************************************************************************
@@ -734,193 +453,6 @@ class TaskBase(object):
 
     def do(self):
         raise NotImplementedError
-
-
-class DownloadMixin(object):
-    def callback_progress(self, blocknum, blocksize, totalsize):
-        percent = 100.0 * blocknum * blocksize / totalsize
-        if percent > 100:
-            percent = 100
-        self.log('%.2f%%' % percent)
-
-    def download_file(self, url, to_dir, fname=None):
-        filename = os.path.join(to_dir, os.path.basename(url) if fname is None else fname)
-        logger.info('Starting to download file: %s ...' % url)
-        self.log('开始下载文件: %s ...' % url)
-        try:
-            urllib.urlretrieve(url, filename)
-        except Exception as e:
-            logger.exception('Download file fail: %s' % url)
-            self.log('Download file error:' + str(e))
-            return
-        logger.info('Success to download file: %s' % url)
-        self.log('下载完成: %s' % url)
-        return filename
-
-
-class TaskIceDeploy(DownloadMixin, TaskBase):
-    def __init__(self, node_name, service_name, identifier, priority, jar, jar_md5, conf, conf_md5, pkg_dest_path):
-        super(TaskIceDeploy, self).__init__(service_name, identifier, priority)
-        self.node_name = node_name.encode('utf-8')
-        self.jar = jar
-        self.jar_md5 = jar_md5
-        self.conf = conf
-        self.conf_md5 = conf_md5
-        self._pkg_dest_path = pkg_dest_path
-
-    def header(self):
-        return '{0} :: {1} :: '.format(self.node_name, time.strftime('%Y-%m-%d %H:%M:%S'))
-
-    def download_jar(self):
-        if self.jar:
-            return self.download_file(self.jar, ICE_PROJECT_DIR)
-
-    def download_conf(self):
-        if self.conf:
-            return self.download_file(self.conf, ICE_PROJECT_DIR)
-
-    def deploy(self, jar, conf):
-        if os.path.exists(self._pkg_dest_path):
-            self.log('开始备份旧版本文件...')
-            backup_dir(self._pkg_dest_path)
-            clear_dir(self._pkg_dest_path)
-            self.log('备份完成!')
-        else:
-            self.log('创建工程目录: %s' % self._pkg_dest_path)
-            os.makedirs(self._pkg_dest_path)
-        self.log('处理文件 ...')
-        lib_path = os.path.join(self._pkg_dest_path, 'lib')
-        os.mkdir(lib_path)
-        shutil.move(jar, lib_path)
-        if conf:
-            unzip(conf, self._pkg_dest_path)
-        self.log('文件处理完成...')
-        self.log('>>>>>>>>>>>>>>>>完成<<<<<<<<<<<<<<<<<<')
-
-    def do(self):
-        jar = self.download_jar()
-        conf = self.download_conf()
-        if jar:
-            self.check_md5(jar, self.jar_md5)
-        if conf:
-            self.check_md5(conf, self.conf_md5)
-        if jar:
-            self.deploy(jar, conf)
-        else:
-            self.log('jar包地址有误, 部署失败')
-
-
-class TaskTomcatWar(DownloadMixin, TaskBase):
-    def __init__(self, host, app_name, identifier, priority, war_url, war_md5, war_dir):
-        super(TaskTomcatWar, self).__init__(app_name, identifier, priority)
-        self.host = host
-        self.war_url = war_url
-        self.war_md5 = war_md5
-        self.war_dir = war_dir
-
-    def header(self):
-        return '{0} :: {1} :: '.format(self.host, time.strftime('%Y-%m-%d %H:%M:%S'))
-
-    def download_war(self):
-        return self.download_file(self.war_url, TOMCAT_DIR, fname=self.name+'.war')
-
-    def do(self):
-        if not os.path.exists(self.war_dir):
-            self.log('指定的War包目录不存在 %s' % self.war_dir)
-            raise ValueError('ERROR: 指定的War包目录不存在 %s' % self.war_dir)
-
-        war = self.download_war()
-        if not os.path.isfile(war):
-            self.log('ERROR: %s 文件不存在!' % os.path.basename(war))
-            raise ValueError('ERROR: %s 文件不存在!' % os.path.basename(war))
-
-        self.check_md5(war, self.war_md5)
-
-        # 移除tomcat解压的war的目录
-        real_war = os.path.join(self.war_dir, self.name)
-        if os.path.exists(real_war):
-            shutil.rmtree(real_war, ignore_errors=True)
-
-        # 移除ROOT
-        root_path = os.path.join(self.war_dir, 'ROOT')
-        if os.path.exists(root_path):
-            self.log('移除ROOT目录')
-            shutil.rmtree(root_path, ignore_errors=True)
-
-        self.log('移动War包到: %s' % self.war_dir)
-
-        # 如果war包文件已经存在, 删除之
-        if os.path.isfile(os.path.join(self.war_dir, os.path.basename(war))):
-            self.log('该War包: %s 已经存在!' % os.path.join(self.war_dir, os.path.basename(war)))
-            self.log('移除旧War包...')
-            try:
-                os.remove(os.path.join(self.war_dir, os.path.basename(war)))
-            except OSError:  # Permission denied
-                self.log('ERROR: 不能移除War包: %s Permission denied' % os.path.join(self.war_dir, os.path.basename(war)))
-                raise
-            self.log('旧War包已经移除')
-            self.log('开始安装新War包')
-        try:
-            shutil.move(war, self.war_dir)
-        except (IOError, shutil.Error) as e:
-            self.log(unicode(e))
-            raise
-        self.log('>>>>>>>>>>>>>>>>完成<<<<<<<<<<<<<<<<<<')
-
-
-class TaskCustomScript(TaskBase):
-    def __init__(self, name, identifier, priority, script_url):
-        super(TaskCustomScript, self).__init__(name, identifier, priority)
-        self._script_url = script_url
-        self._script_path = os.path.join(SCRIPTS_DIR, os.path.basename(self._script_url))
-
-    def download_script(self):
-        urllib.urlretrieve(self._script_url, self._script_path)
-        return self._script_path
-
-    def run_script(self):
-        os.chmod(self._script_path, stat.S_IRWXU)
-        old_dir = os.getcwd()
-        os.chdir(SCRIPTS_DIR)
-        p = subprocess.Popen(self._script_path, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        os.chdir(old_dir)
-        return p
-
-    def do(self):
-        logger.info('Starting to download script: %s ...' % self._script_url)
-        self.log('开始下载脚本: %s ...' % self._script_url)
-        try:
-            self.download_script()
-        except IOError as e:
-            logger.error('Download script fail: %s' % self._script_url)
-            self.log(str(e))
-            return
-        else:
-            logger.info('Success to download script: %s' % self._script_url)
-            self.log('脚本下载完成: %s' % self._script_url)
-        self.log('运行脚本...')
-        self.run_script()
-        self.log('脚本运行成功')
-
-
-def task_factory(task_info):
-    type_ = task_info.pop('type')
-    if type_ == 'ice':
-        return TaskIceDeploy(
-            task_info['node_name'], task_info['name'], task_info['identifier'],
-            task_info['priority'], task_info['jar'], task_info['jar_md5'],
-            task_info['conf'], task_info['conf_md5'], task_info['pkg_dest_dir']
-        )
-    if type_ == 'tomcat':
-        return TaskTomcatWar(
-            task_info['host'], task_info['app_name'], task_info['identifier'],
-            task_info['priority'], task_info['war_url'], task_info['war_md5'], task_info['war_dir']
-        )
-    if type_ == 'script':
-        return TaskCustomScript(
-            task_info['name'], task_info['identifier'], task_info['priority'],
-            task_info['script_url']
-        )
 
 
 class XmlRpcServer(SimpleXMLRPCServer):
