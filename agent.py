@@ -16,8 +16,6 @@ import urllib
 import urllib2
 import zipfile
 import hashlib
-import stat
-import signal
 import logging
 import argparse
 import subprocess
@@ -86,7 +84,6 @@ SOCKET_TYPES = socket_constants('SOCK_')
 def base_info():
     return {
         'hostname': socket.gethostname(),
-        'system': dmidecode_system(),
         'os_distribution': '-'.join(platform.linux_distribution()),
         'os_verbose': platform.platform(),
         'cpu_info': cpu_info(),
@@ -421,42 +418,25 @@ class TaskQueue(PriorityQueue):
 
 class TaskBase(object):
     def __init__(self, name, identifier, priority):
-        logger.info('Construct Task: %s uuid: %s ...' % (name, identifier))
         self.name = name
         self.identifier = identifier
         self.priority = int(priority)
-        self._log_init()
 
-    def header(self):
+    def prefix(self):
         return '{} :: '.format(time.strftime('%Y-%m-%d %H:%M:%S'))
 
     def check_md5(self, fname, md5):
-        self.log('MD5校验: %s ...' % os.path.basename(fname))
         if hashlib.md5(open(fname, 'rb').read()).hexdigest() == md5:
-            self.log('MD5校验 - %s, 文件: %s' % ('OK', os.path.basename(fname)))
+            pass
         else:
-            self.log('MD5校验 - %s, 文件: %s' % ('FAILED', os.path.basename(fname)))
             raise ValueError('MD5校验 - %s, 文件: %s' % ('FAILED', os.path.basename(fname)))
-
-    def _log_init(self):
-        return http_post_json(REDIS_LOG_URL, {
-            'act': 'init',
-            'id': self.identifier,
-        })
-
-    def log(self, info):
-        return http_post_json(REDIS_LOG_URL, {
-            'act': 'log',
-            'id': self.identifier,
-            'msg': self.header() + info
-        })
 
     def do(self):
         raise NotImplementedError
 
 
 class XmlRpcServer(SimpleXMLRPCServer):
-    allow_client_hosts = (MARMOT_HOST, 'localhost', '127.0.0.1', '10.20.0.202')
+    allow_client_hosts = ('localhost', '127.0.0.1', '10.20.0.202')
 
     def __init__(self, host, port):
         SimpleXMLRPCServer.__init__(self, (host, port), allow_none=True)
@@ -470,10 +450,6 @@ class Node(object):
         self._service = None
         self._ip = ip
         self._tasks = TaskQueue()
-        self.cpu_monitor = CpuMonitor(self._ip)
-        self.memory_monitor = MemoryMonitor(self._ip)
-        self.disk_monitor = DiskMonitor(self._ip)
-        self.process_monitor = ProcessMonitor(self._ip)
 
     @property
     def id(self):
@@ -499,35 +475,6 @@ class NodeService(object):
     def __init__(self, node):
         self.node = node
 
-    def set_memory_monitor_level(self, level):
-        logger.info('Set memory-monitor alarm level: %s' % level)
-        self.node.memory_monitor.set_alarm_level(level)
-
-    def set_disk_monitor_level(self, level):
-        logger.info('Set disk-monitor alarm level: %s' % level)
-        self.node.disk_monitor.set_alarm_level(level)
-
-    def set_alarm_interval(self, interval):
-        logger.info('Set alarm interval: %s' % interval)
-        self.node.cpu_monitor.set_alarm_interval(interval)
-        self.node.memory_monitor.set_alarm_interval(interval)
-        self.node.disk_monitor.set_alarm_interval(interval)
-        self.node.process_monitor.set_alarm_interval(interval)
-
-    def start_monitor(self):
-        logger.info('Start monitors...')
-        self.node.cpu_monitor.start()
-        self.node.memory_monitor.start()
-        self.node.disk_monitor.start()
-        self.node.process_monitor.start()
-
-    def stop_monitor(self):
-        logger.info('Stop monitors...')
-        self.node.cpu_monitor.stop()
-        self.node.memory_monitor.stop()
-        self.node.disk_monitor.stop()
-        self.node.process_monitor.stop()
-
     def add_task(self, task_info):
         logger.info('Received task: %s' % task_info)
         try:
@@ -547,15 +494,6 @@ class NodeService(object):
             logger.exception('netstat ERROR')
             return ''
 
-    def get_es_info(self, url):
-        try:
-            req = urllib2.Request(url)
-            resp = urllib2.urlopen(req)
-            return resp.read()
-        except Exception:
-            logger.exception('Get ES info ERROR')
-            return ''
-
     def path_exists(self, path):
         return os.path.exists(path)
 
@@ -567,7 +505,6 @@ class NodeService(object):
             return False
 
     def kill_process(self, cmd):
-        logger.info('Received task: kill process - %s' % cmd)
         cmd_flag = os.path.sep.join(cmd.split(os.path.sep)[:3])
         for p in psutil.process_iter():
             cmdline = ''.join(p.cmdline())
@@ -576,34 +513,8 @@ class NodeService(object):
                     p.kill()
                     return True
                 except psutil.AccessDenied:
-                    ret = os.system('sudo su - www -c "kill -9 %s"' % p.pid)
-                    if ret == 0:
-                        logger.info('Kill process - %s SUCCESS' % cmd)
-                        return True
-                    else:
-                        logger.info('Kill process - %s FAILS -- AccessDenied' % cmd)
-                        return False
-        logger.info('Kill process - %s FAIL. The process is not exists!' % cmd)
+                    return False
         return False
-
-    def tomcat_is_alive(self, cmd):
-        cmd_flag = os.path.sep.join(cmd.split(os.path.sep)[:3])
-        for p in psutil.process_iter():
-            cmdline = ''.join(p.cmdline())
-            if cmd_flag in cmdline and 'java' in cmdline:
-                return True
-        return False
-
-    def start_tomcat(self, cmd):
-        logger.info('Received task: Start tomcat - %s' % cmd)
-        # ret = os.system('sudo su - www -c "%s"' % cmd)
-        ret = os.system(cmd)
-        if ret == 0:
-            logger.info('Start tomcat - %s SUCCESS' % cmd)
-            return True
-        else:
-            logger.info('Start tomcat - %s FAIL' % cmd)
-            return False
 
     def is_alive(self):
         return True
@@ -636,18 +547,6 @@ class MarmotAgent(object):
     @classmethod
     def create_from_cli(cls):
         config = cls.handle_commandline()
-        local_ip = get_local_ip(ifname=IFNAME)
-        if local_ip is None:
-            logger.error('Can not get local ip')
-            raise OSError
-        logger.info('Local ip: %s' % local_ip)
-        try:
-            conf = http_get_json(CONF_URL, {'ip': local_ip})
-        except IOError:
-            logger.warning('Can not get node config - %s' % CONF_URL)
-            conf = DEFAULT_CONF
-        conf['ip'] = local_ip
-        config.update(conf)
         return cls(config)
 
     @staticmethod
@@ -666,26 +565,16 @@ class MarmotAgent(object):
 
     def __init__(self, config):
         self.config = config
-        self.monitor_conf = self.config.pop('monitor')
         self._service = Node(self.config.pop('ip')).get_service()
-        if self.monitor_conf:
-            self._service.set_memory_monitor_level(self.monitor_conf['memory'])
-            self._service.set_disk_monitor_level(self.monitor_conf['disk'])
-            self._service.set_alarm_interval(self.monitor_conf['alarm_interval'])
-            if self.monitor_conf['enabled']:
-                self._service.start_monitor()
 
     def _task_worker(self):
-        logger.info('Starting task-worker...')
         task_queue = self._service.node.get_task_queue()
         while True:
             task = task_queue.pop_task()
-            logger.info('Start run task: %s' % task.name)
             try:
                 task.do()
             except Exception as e:
-                task.log("出错啦！ - " + unicode(e))
-                logger.exception('Task: %s error' % task.name)
+                pass
 
     def _setup_workers(self):
         gevent.spawn_later(1, self._task_worker)
@@ -732,5 +621,4 @@ def main():
 
 
 if __name__ == '__main__':
-    gevent.signal(signal.SIGQUIT, gevent.kill)
     main()
