@@ -1,9 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-
-"""doc string"""
-
-__author__ = 'Pysaoke'
+import os
+import sys
 
 
 
