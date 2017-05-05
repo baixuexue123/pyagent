@@ -36,6 +36,27 @@ __version__ = '0.0.1'
 # **********************************************************************************
 
 
+def dmidecode_system(pattern=re.compile(r'System Information\n\tManufacturer: (?P<manufacturer>.*)\n'
+                                        r'\tProduct Name: (?P<product_name>.*)\n'
+                                        r'\tVersion: (?P<version>.*)\n'
+                                        r'\tSerial Number: (?P<serial_number>.*)\n'
+                                        r'\tUUID: (?P<uuid>.*)\n'
+                                        r'\t(.)*\n'
+                                        r'\t(.)*\n'
+                                        r'\tFamily: (?P<family>.*)\n')):
+
+    content = subprocess.check_output(['sudo', 'dmidecode'])
+    match = re.search(pattern, content)
+    return {
+        'manufacturer': match.group('manufacturer'),
+        'product-name': match.group('product_name'),
+        'version': match.group('version'),
+        'serial-number': match.group('serial_number'),
+        'uuid': match.group('uuid'),
+        'family:': match.group('family'),
+    }
+
+
 def _linux_os_release():
     """Try to determine the name of a Linux distribution.
     This function checks for the /etc/os-release file.
@@ -115,8 +136,23 @@ SOCKET_FAMILIES = socket_constants('AF_')
 SOCKET_TYPES = socket_constants('SOCK_')
 
 # **********************************************************************************
-#
+# utils
 # **********************************************************************************
+
+
+def human_size(_bytes, traditional=((1024 ** 5, 'P'),
+                                    (1024 ** 4, 'T'),
+                                    (1024 ** 3, 'G'),
+                                    (1024 ** 2, 'M'),
+                                    (1024 ** 1, 'K'),
+                                    (1024 ** 0, 'B'))):
+    """Human-readable size"""
+    for factor, suffix in traditional:
+        if _bytes >= factor:
+            amount = round(_bytes/factor, 2)
+            return str(amount) + suffix
+    else:
+        return str(_bytes)
 
 
 class Timer(object):
@@ -179,9 +215,7 @@ class ThreadActor(threading.Thread):
         self._timeout = None
 
     def _work(self):
-        """
-        Define in your subclass.
-        """
+        """Define in your subclass."""
         raise NotImplemented()
 
     def run(self):
@@ -218,9 +252,7 @@ class ProcessActor(multiprocessing.Process):
         self._timeout = None
 
     def _work(self):
-        """
-        Define in your subclass.
-        """
+        """Define in your subclass."""
         raise NotImplemented()
 
     def run(self):
@@ -376,7 +408,7 @@ class Agent(object):
 
     @staticmethod
     def handle_commandline():
-        parser = argparse.ArgumentParser(description='Marmot -- agent')
+        parser = argparse.ArgumentParser(description='xxx -- agent')
         parser.add_argument('-b', '--bind',
                             action='store', dest='host', default=None, metavar='host',
                             help='host to bind default to 0.0.0.0')
@@ -411,14 +443,14 @@ class Agent(object):
     def _run_rpc(self):
         host = self.config['host'] or self.BIND_HOST
         port = self.config['port'] or self.PORT
-        logger.info('Starting Marmot RPC-Server on %s:%s' % (host, port))
+        logger.info('Starting RPC-Server on %s:%s' % (host, port))
         self.server = XmlRpcServer(host, port)
         self.server.logRequests = self.config['debug']
         self.server.register_instance(self._service)
         return self.server.serve_forever()
 
     def run(self):
-        logger.info('Starting Marmot agent...')
+        logger.info('Starting agent...')
         self._setup_workers()
         return self._run_rpc()
 
