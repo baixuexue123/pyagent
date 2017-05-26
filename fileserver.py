@@ -1,7 +1,8 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-"""Simple HTTP Server With Upload.
+"""
+Simple HTTP Server With Upload.
 
 This module builds on BaseHTTPServer by implementing the standard GET
 and HEAD requests in a fairly straightforward manner.
@@ -12,11 +13,13 @@ import re
 import sys
 import cgi
 import urllib
+import warnings
 import socket
 import SocketServer
 import BaseHTTPServer
 from optparse import OptionParser
 from threading import local
+from collections import MutableMapping as DictMixin
 from SimpleHTTPServer import SimpleHTTPRequestHandler
 
 try:
@@ -29,9 +32,236 @@ except ImportError:
 # utils
 # *********************************************************************
 
+def _e(): return sys.exc_info()[1]
+
+
+def depr(message, hard=False):
+    warnings.warn(message, DeprecationWarning, stacklevel=3)
+
+
+class cached_property(object):
+    """
+    A property that is only computed once per instance and then replaces
+    itself with an ordinary attribute. Deleting the attribute resets the
+    property.
+    """
+
+    def __init__(self, func):
+        self.__doc__ = getattr(func, '__doc__')
+        self.func = func
+
+    def __get__(self, obj, cls):
+        if obj is None: return self
+        value = obj.__dict__[self.func.__name__] = self.func(obj)
+        return value
+
+
+class ConfigDict(dict):
+    ''' A dict-like configuration storage with additional support for
+        namespaces, validators, meta-data, on_change listeners and more.
+
+        This storage is optimized for fast read access. Retrieving a key
+        or using non-altering dict methods (e.g. `dict.get()`) has no overhead
+        compared to a native dict.
+    '''
+    __slots__ = ('_meta', '_on_change')
+
+    class Namespace(DictMixin):
+
+        def __init__(self, config, namespace):
+            self._config = config
+            self._prefix = namespace
+
+        def __getitem__(self, key):
+            depr('Accessing namespaces as dicts is discouraged. '
+                 'Only use flat item access: '
+                 'cfg["names"]["pace"]["key"] -> cfg["name.space.key"]') #0.12
+            return self._config[self._prefix + '.' + key]
+
+        def __setitem__(self, key, value):
+            self._config[self._prefix + '.' + key] = value
+
+        def __delitem__(self, key):
+            del self._config[self._prefix + '.' + key]
+
+        def __iter__(self):
+            ns_prefix = self._prefix + '.'
+            for key in self._config:
+                ns, dot, name = key.rpartition('.')
+                if ns == self._prefix and name:
+                    yield name
+
+        def keys(self): return [x for x in self]
+        def __len__(self): return len(self.keys())
+        def __contains__(self, key): return self._prefix + '.' + key in self._config
+        def __repr__(self): return '<Config.Namespace %s.*>' % self._prefix
+        def __str__(self): return '<Config.Namespace %s.*>' % self._prefix
+
+        # Deprecated ConfigDict features
+        def __getattr__(self, key):
+            depr('Attribute access is deprecated.')  # 0.12
+            if key not in self and key[0].isupper():
+                self[key] = ConfigDict.Namespace(self._config, self._prefix + '.' + key)
+            if key not in self and key.startswith('__'):
+                raise AttributeError(key)
+            return self.get(key)
+
+        def __setattr__(self, key, value):
+            if key in ('_config', '_prefix'):
+                self.__dict__[key] = value
+                return
+            depr('Attribute assignment is deprecated.') #0.12
+            if hasattr(DictMixin, key):
+                raise AttributeError('Read-only attribute.')
+            if key in self and self[key] and isinstance(self[key], self.__class__):
+                raise AttributeError('Non-empty namespace attribute.')
+            self[key] = value
+
+        def __delattr__(self, key):
+            if key in self:
+                val = self.pop(key)
+                if isinstance(val, self.__class__):
+                    prefix = key + '.'
+                    for key in self:
+                        if key.startswith(prefix):
+                            del self[prefix+key]
+
+        def __call__(self, *a, **ka):
+            depr('Calling ConfDict is deprecated. Use the update() method.') #0.12
+            self.update(*a, **ka)
+            return self
+
+    def __init__(self, *a, **ka):
+        self._meta = {}
+        self._on_change = lambda name, value: None
+        if a or ka:
+            depr('Constructor does no longer accept parameters.') #0.12
+            self.update(*a, **ka)
+
+    def load_config(self, filename):
+        ''' Load values from an *.ini style config file.
+
+            If the config file contains sections, their names are used as
+            namespaces for the values within. The two special sections
+            ``DEFAULT`` and ``bottle`` refer to the root namespace (no prefix).
+        '''
+        conf = ConfigParser()
+        conf.read(filename)
+        for section in conf.sections():
+            for key, value in conf.items(section):
+                if section not in ('DEFAULT', 'bottle'):
+                    key = section + '.' + key
+                self[key] = value
+        return self
+
+    def load_dict(self, source, namespace='', make_namespaces=False):
+        ''' Import values from a dictionary structure. Nesting can be used to
+            represent namespaces.
+
+            >>> ConfigDict().load_dict({'name': {'space': {'key': 'value'}}})
+            {'name.space.key': 'value'}
+        '''
+        stack = [(namespace, source)]
+        while stack:
+            prefix, source = stack.pop()
+            if not isinstance(source, dict):
+                raise TypeError('Source is not a dict (r)' % type(key))
+            for key, value in source.items():
+                if not isinstance(key, basestring):
+                    raise TypeError('Key is not a string (%r)' % type(key))
+                full_key = prefix + '.' + key if prefix else key
+                if isinstance(value, dict):
+                    stack.append((full_key, value))
+                    if make_namespaces:
+                        self[full_key] = self.Namespace(self, full_key)
+                else:
+                    self[full_key] = value
+        return self
+
+    def update(self, *a, **ka):
+        ''' If the first parameter is a string, all keys are prefixed with this
+            namespace. Apart from that it works just as the usual dict.update().
+            Example: ``update('some.namespace', key='value')`` '''
+        prefix = ''
+        if a and isinstance(a[0], basestring):
+            prefix = a[0].strip('.') + '.'
+            a = a[1:]
+        for key, value in dict(*a, **ka).items():
+            self[prefix+key] = value
+
+    def setdefault(self, key, value):
+        if key not in self:
+            self[key] = value
+        return self[key]
+
+    def __setitem__(self, key, value):
+        if not isinstance(key, basestring):
+            raise TypeError('Key has type %r (not a string)' % type(key))
+
+        value = self.meta_get(key, 'filter', lambda x: x)(value)
+        if key in self and self[key] is value:
+            return
+        self._on_change(key, value)
+        dict.__setitem__(self, key, value)
+
+    def __delitem__(self, key):
+        dict.__delitem__(self, key)
+
+    def clear(self):
+        for key in self:
+            del self[key]
+
+    def meta_get(self, key, metafield, default=None):
+        ''' Return the value of a meta field for a key. '''
+        return self._meta.get(key, {}).get(metafield, default)
+
+    def meta_set(self, key, metafield, value):
+        ''' Set the meta field for a key to a new value. This triggers the
+            on-change handler for existing keys. '''
+        self._meta.setdefault(key, {})[metafield] = value
+        if key in self:
+            self[key] = self[key]
+
+    def meta_list(self, key):
+        ''' Return an iterable of meta field names defined for a key. '''
+        return self._meta.get(key, {}).keys()
+
+    # Deprecated ConfigDict features
+    def __getattr__(self, key):
+        depr('Attribute access is deprecated.') #0.12
+        if key not in self and key[0].isupper():
+            self[key] = self.Namespace(self, key)
+        if key not in self and key.startswith('__'):
+            raise AttributeError(key)
+        return self.get(key)
+
+    def __setattr__(self, key, value):
+        if key in self.__slots__:
+            return dict.__setattr__(self, key, value)
+        depr('Attribute assignment is deprecated.') #0.12
+        if hasattr(dict, key):
+            raise AttributeError('Read-only attribute.')
+        if key in self and self[key] and isinstance(self[key], self.Namespace):
+            raise AttributeError('Non-empty namespace attribute.')
+        self[key] = value
+
+    def __delattr__(self, key):
+        if key in self:
+            val = self.pop(key)
+            if isinstance(val, self.Namespace):
+                prefix = key + '.'
+                for key in self:
+                    if key.startswith(prefix):
+                        del self[prefix+key]
+
+    def __call__(self, *a, **ka):
+        depr('Calling ConfDict is deprecated. Use the update() method.') #0.12
+        self.update(*a, **ka)
+        return self
+
 
 # *********************************************************************
-# route from bottle
+# route
 # *********************************************************************
 
 class RouteError(Exception):
@@ -39,12 +269,14 @@ class RouteError(Exception):
 
 
 class RouteReset(Exception):
-    """ If raised by a plugin or request handler, the route is reset and all
-        plugins are re-applied.
+    """
+    If raised by a plugin or request handler, the route is reset and all
+    plugins are re-applied.
     """
 
 
-class RouterUnknownModeError(RouteError): pass
+class RouterUnknownModeError(RouteError):
+    pass
 
 
 class RouteSyntaxError(RouteError):
@@ -56,8 +288,9 @@ class RouteBuildError(RouteError):
 
 
 def _re_flatten(p):
-    """ Turn all capturing groups in a regular expression pattern into
-        non-capturing groups.
+    """
+    Turn all capturing groups in a regular expression pattern into
+    non-capturing groups.
     """
     if '(' not in p: return p
     return re.sub(r'(\\*)(\(\?P<[^>]+>|\((?!\?))',
@@ -65,15 +298,16 @@ def _re_flatten(p):
 
 
 class Router(object):
-    """ A Router is an ordered collection of route->target pairs. It is used to
-        efficiently match WSGI requests against a number of routes and return
-        the first target that satisfies the request. The target may be anything,
-        usually a string, ID or callable object. A route consists of a path-rule
-        and a HTTP method.
+    """
+    A Router is an ordered collection of route->target pairs. It is used to
+    efficiently match WSGI requests against a number of routes and return
+    the first target that satisfies the request. The target may be anything,
+    usually a string, ID or callable object. A route consists of a path-rule
+    and a HTTP method.
 
-        The path-rule is either a static path (e.g. `/contact`) or a dynamic
-        path that contains wildcards (e.g. `/wiki/<page>`). The wildcard syntax
-        and details on the matching order are described in docs:`routing`.
+    The path-rule is either a static path (e.g. `/contact`) or a dynamic
+    path that contains wildcards (e.g. `/wiki/<page>`). The wildcard syntax
+    and details on the matching order are described in docs:`routing`.
     """
 
     default_pattern = '[^/]+'
@@ -100,9 +334,11 @@ class Router(object):
             'path':  lambda conf: (r'.+?', None, None)}
 
     def add_filter(self, name, func):
-        ''' Add a filter. The provided function is called with the configuration
+        """
+        Add a filter. The provided function is called with the configuration
         string as parameter and must return a (regexp, to_python, to_url) tuple.
-        The first element is a string, the last two are callables or None. '''
+        The first element is a string, the last two are callables or None.
+        """
         self.filters[name] = func
 
     rule_syntax = re.compile('(\\\\*)'\
@@ -128,7 +364,7 @@ class Router(object):
             yield prefix+rule[offset:], None, None
 
     def add(self, rule, method, target, name=None):
-        ''' Add a new rule or replace the target for an existing rule. '''
+        """ Add a new rule or replace the target for an existing rule. """
         anons     = 0    # Number of anonymous wildcards found
         keys      = []   # Names of keys
         pattern   = ''   # Regular expression pattern with named groups
@@ -210,7 +446,7 @@ class Router(object):
             comborules.append((combined, rules))
 
     def build(self, _name, *anons, **query):
-        ''' Build an URL by filling the wildcards in a rule. '''
+        """ Build an URL by filling the wildcards in a rule. """
         builder = self.builder.get(_name)
         if not builder: raise RouteBuildError("No route with that name.", _name)
         try:
@@ -221,7 +457,7 @@ class Router(object):
             raise RouteBuildError('Missing URL argument: %r' % _e().args[0])
 
     def match(self, environ):
-        ''' Return a (target, url_agrs) tuple or raise HTTPError(400/404/405). '''
+        """ Return a (target, url_agrs) tuple or raise HTTPError(400/404/405). """
         verb = environ['REQUEST_METHOD'].upper()
         path = environ['PATH_INFO'] or '/'
         target = None
@@ -261,9 +497,10 @@ class Router(object):
 
 
 class Route(object):
-    """ This class wraps a route callback along with route specific metadata and
-        configuration and applies Plugins on demand. It is also responsible for
-        turing an URL path rule into a regular expression usable by the Router.
+    """
+    This class wraps a route callback along with route specific metadata and
+    configuration and applies Plugins on demand. It is also responsible for
+    turing an URL path rule into a regular expression usable by the Router.
     """
 
     def __init__(self, app, rule, method, callback, name=None,
@@ -295,17 +532,19 @@ class Route(object):
 
     @cached_property
     def call(self):
-        ''' The route callback with all plugins applied. This property is
-            created on demand and then cached to speed up subsequent requests.'''
+        """
+        The route callback with all plugins applied. This property is
+        created on demand and then cached to speed up subsequent requests.
+        """
         return self._make_callback()
 
     def reset(self):
-        ''' Forget any cached values. The next time :attr:`call` is accessed,
-            all plugins are re-applied. '''
+        """ Forget any cached values. The next time :attr:`call` is accessed,
+            all plugins are re-applied. """
         self.__dict__.pop('call', None)
 
     def prepare(self):
-        ''' Do all on-demand work immediately (useful for debugging).'''
+        """ Do all on-demand work immediately (useful for debugging)."""
         self.call
 
     @property
@@ -316,7 +555,7 @@ class Route(object):
                     apply=self.plugins, skip=self.skiplist)
 
     def all_plugins(self):
-        ''' Yield all Plugins affecting this route. '''
+        """ Yield all Plugins affecting this route. """
         unique = set()
         for p in reversed(self.app.plugins + self.plugins):
             if True in self.skiplist: break
@@ -343,8 +582,8 @@ class Route(object):
         return callback
 
     def get_undecorated_callback(self):
-        ''' Return the callback. If the callback is a decorated function, try to
-            recover the original function. '''
+        """ Return the callback. If the callback is a decorated function, try to
+            recover the original function. """
         func = self.callback
         func = getattr(func, '__func__' if py3k else 'im_func', func)
         closure_attr = '__closure__' if py3k else 'func_closure'
@@ -353,14 +592,14 @@ class Route(object):
         return func
 
     def get_callback_args(self):
-        ''' Return a list of argument names the callback (most likely) accepts
+        """ Return a list of argument names the callback (most likely) accepts
             as keyword arguments. If the callback is a decorated function, try
-            to recover the original function before inspection. '''
+            to recover the original function before inspection. """
         return getargspec(self.get_undecorated_callback())[0]
 
     def get_config(self, key, default=None):
-        ''' Lookup a config field and return its value, first checking the
-            route.config, then route.app.config.'''
+        """ Lookup a config field and return its value, first checking the
+            route.config, then route.app.config."""
         for conf in (self.config, self.app.conifg):
             if key in conf: return conf[key]
         return default
