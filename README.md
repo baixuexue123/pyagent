@@ -1,2 +1,2 @@
 # pyagent
-agent of the remote pc
+Agent of the remote host

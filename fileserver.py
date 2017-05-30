@@ -2,30 +2,44 @@
 # -*- coding: utf-8 -*-
 
 """
-Simple HTTP Server With Upload.
-
-This module builds on BaseHTTPServer by implementing the standard GET
-and HEAD requests in a fairly straightforward manner.
+Simple HTTP Server
 """
 
-import os
-import re
-import sys
-import cgi
-import urllib
-import warnings
-import socket
-import SocketServer
-import BaseHTTPServer
-from optparse import OptionParser
-from threading import local
+import os, sys, re, cgi, email, time, hmac, json, urllib, httplib,\
+    socket, base64, threading, SocketServer, BaseHTTPServer,\
+    warnings, argparse, functools
+
+import cPickle as pickle
+from unicodedata import normalize
+from tempfile import TemporaryFile
+from urlparse import urljoin, SplitResult as UrlSplitResult
+from urllib import urlencode, quote as urlquote, unquote as urlunquote
+from inspect import getargspec
+from datetime import date as datedate, datetime, timedelta
 from collections import MutableMapping as DictMixin
 from SimpleHTTPServer import SimpleHTTPRequestHandler
+from ConfigParser import SafeConfigParser as ConfigParser
 
 try:
     from cStringIO import StringIO
 except ImportError:
     from StringIO import StringIO
+
+
+# *********************************************************************
+# Common
+# *********************************************************************
+
+
+#: A dict to map HTTP status codes (e.g. 404) to phrases (e.g. 'Not Found')
+HTTP_CODES = httplib.responses
+HTTP_CODES[418] = "I'm a teapot"  # RFC 2324
+HTTP_CODES[422] = "Unprocessable Entity"  # RFC 4918
+HTTP_CODES[428] = "Precondition Required"
+HTTP_CODES[429] = "Too Many Requests"
+HTTP_CODES[431] = "Request Header Fields Too Large"
+HTTP_CODES[511] = "Network Authentication Required"
+_HTTP_STATUS_LINES = {k: '%d %s'%(k,v) for (k,v) in HTTP_CODES.items()}
 
 
 # *********************************************************************
@@ -37,6 +51,52 @@ def _e(): return sys.exc_info()[1]
 
 def depr(message, hard=False):
     warnings.warn(message, DeprecationWarning, stacklevel=3)
+
+
+# A bug in functools causes it to break if the wrapper is an instance method
+def update_wrapper(wrapper, wrapped, *a, **ka):
+    try:
+        functools.update_wrapper(wrapper, wrapped, *a, **ka)
+    except AttributeError:
+        pass
+
+
+# Some helpers for string/byte handling
+def tob(s, enc='utf8'):
+    return s.encode(enc) if isinstance(s, unicode) else bytes(s)
+def touni(s, enc='utf8', err='strict'):
+    return s.decode(enc, err) if isinstance(s, bytes) else unicode(s)
+
+tonat = tob
+
+
+class DictProperty(object):
+    """ Property that maps to a key in a local dict-like attribute. """
+    def __init__(self, attr, key=None, read_only=False):
+        self.attr, self.key, self.read_only = attr, key, read_only
+
+    def __call__(self, func):
+        functools.update_wrapper(self, func, updated=[])
+        self.getter, self.key = func, self.key or func.__name__
+        return self
+
+    def __get__(self, obj, cls):
+        if obj is None:
+            return self
+        key, storage = self.key, getattr(obj, self.attr)
+        if key not in storage:
+            storage[key] = self.getter(obj)
+        return storage[key]
+
+    def __set__(self, obj, value):
+        if self.read_only:
+            raise AttributeError("Read-Only property.")
+        getattr(obj, self.attr)[self.key] = value
+
+    def __delete__(self, obj):
+        if self.read_only:
+            raise AttributeError("Read-Only property.")
+        del getattr(obj, self.attr)[self.key]
 
 
 class cached_property(object):
@@ -51,19 +111,20 @@ class cached_property(object):
         self.func = func
 
     def __get__(self, obj, cls):
-        if obj is None: return self
+        if obj is None:
+            return self
         value = obj.__dict__[self.func.__name__] = self.func(obj)
         return value
 
 
 class ConfigDict(dict):
-    ''' A dict-like configuration storage with additional support for
+    """ A dict-like configuration storage with additional support for
         namespaces, validators, meta-data, on_change listeners and more.
 
         This storage is optimized for fast read access. Retrieving a key
         or using non-altering dict methods (e.g. `dict.get()`) has no overhead
         compared to a native dict.
-    '''
+    """
     __slots__ = ('_meta', '_on_change')
 
     class Namespace(DictMixin):
@@ -75,7 +136,7 @@ class ConfigDict(dict):
         def __getitem__(self, key):
             depr('Accessing namespaces as dicts is discouraged. '
                  'Only use flat item access: '
-                 'cfg["names"]["pace"]["key"] -> cfg["name.space.key"]') #0.12
+                 'cfg["names"]["pace"]["key"] -> cfg["name.space.key"]')
             return self._config[self._prefix + '.' + key]
 
         def __setitem__(self, key, value):
@@ -99,7 +160,7 @@ class ConfigDict(dict):
 
         # Deprecated ConfigDict features
         def __getattr__(self, key):
-            depr('Attribute access is deprecated.')  # 0.12
+            depr('Attribute access is deprecated.')
             if key not in self and key[0].isupper():
                 self[key] = ConfigDict.Namespace(self._config, self._prefix + '.' + key)
             if key not in self and key.startswith('__'):
@@ -110,7 +171,7 @@ class ConfigDict(dict):
             if key in ('_config', '_prefix'):
                 self.__dict__[key] = value
                 return
-            depr('Attribute assignment is deprecated.') #0.12
+            depr('Attribute assignment is deprecated.')
             if hasattr(DictMixin, key):
                 raise AttributeError('Read-only attribute.')
             if key in self and self[key] and isinstance(self[key], self.__class__):
@@ -127,7 +188,7 @@ class ConfigDict(dict):
                             del self[prefix+key]
 
         def __call__(self, *a, **ka):
-            depr('Calling ConfDict is deprecated. Use the update() method.') #0.12
+            depr('Calling ConfDict is deprecated. Use the update() method.')
             self.update(*a, **ka)
             return self
 
@@ -135,16 +196,16 @@ class ConfigDict(dict):
         self._meta = {}
         self._on_change = lambda name, value: None
         if a or ka:
-            depr('Constructor does no longer accept parameters.') #0.12
+            depr('Constructor does no longer accept parameters.')
             self.update(*a, **ka)
 
     def load_config(self, filename):
-        ''' Load values from an *.ini style config file.
+        """ Load values from an *.ini style config file.
 
             If the config file contains sections, their names are used as
             namespaces for the values within. The two special sections
             ``DEFAULT`` and ``bottle`` refer to the root namespace (no prefix).
-        '''
+        """
         conf = ConfigParser()
         conf.read(filename)
         for section in conf.sections():
@@ -155,12 +216,12 @@ class ConfigDict(dict):
         return self
 
     def load_dict(self, source, namespace='', make_namespaces=False):
-        ''' Import values from a dictionary structure. Nesting can be used to
+        """ Import values from a dictionary structure. Nesting can be used to
             represent namespaces.
 
             >>> ConfigDict().load_dict({'name': {'space': {'key': 'value'}}})
             {'name.space.key': 'value'}
-        '''
+        """
         stack = [(namespace, source)]
         while stack:
             prefix, source = stack.pop()
@@ -179,9 +240,9 @@ class ConfigDict(dict):
         return self
 
     def update(self, *a, **ka):
-        ''' If the first parameter is a string, all keys are prefixed with this
+        """ If the first parameter is a string, all keys are prefixed with this
             namespace. Apart from that it works just as the usual dict.update().
-            Example: ``update('some.namespace', key='value')`` '''
+            Example: ``update('some.namespace', key='value')`` """
         prefix = ''
         if a and isinstance(a[0], basestring):
             prefix = a[0].strip('.') + '.'
@@ -212,18 +273,18 @@ class ConfigDict(dict):
             del self[key]
 
     def meta_get(self, key, metafield, default=None):
-        ''' Return the value of a meta field for a key. '''
+        """ Return the value of a meta field for a key. """
         return self._meta.get(key, {}).get(metafield, default)
 
     def meta_set(self, key, metafield, value):
-        ''' Set the meta field for a key to a new value. This triggers the
-            on-change handler for existing keys. '''
+        """ Set the meta field for a key to a new value. This triggers the
+            on-change handler for existing keys. """
         self._meta.setdefault(key, {})[metafield] = value
         if key in self:
             self[key] = self[key]
 
     def meta_list(self, key):
-        ''' Return an iterable of meta field names defined for a key. '''
+        """ Return an iterable of meta field names defined for a key. """
         return self._meta.get(key, {}).keys()
 
     # Deprecated ConfigDict features
@@ -255,7 +316,7 @@ class ConfigDict(dict):
                         del self[prefix+key]
 
     def __call__(self, *a, **ka):
-        depr('Calling ConfDict is deprecated. Use the update() method.') #0.12
+        depr('Calling ConfDict is deprecated. Use the update() method.')
         self.update(*a, **ka)
         return self
 
@@ -318,20 +379,20 @@ class Router(object):
     _MAX_GROUPS_PER_PATTERN = 99
 
     def __init__(self, strict=False):
-        self.rules    = [] # All rules in order
-        self._groups  = {} # index of regexes to find them in dyna_routes
-        self.builder  = {} # Data structure for the url builder
-        self.static   = {} # Search structure for static routes
+        self.rules    = []  # All rules in order
+        self._groups  = {}  # index of regexes to find them in dyna_routes
+        self.builder  = {}  # Data structure for the url builder
+        self.static   = {}  # Search structure for static routes
         self.dyna_routes   = {}
-        self.dyna_regexes  = {} # Search structure for dynamic routes
-        #: If true, static routes are no longer checked first.
+        self.dyna_regexes  = {}  # Search structure for dynamic routes
+        # If true, static routes are no longer checked first.
         self.strict_order = strict
         self.filters = {
-            're':    lambda conf:
-                (_re_flatten(conf or self.default_pattern), None, None),
+            're':    lambda conf: (_re_flatten(conf or self.default_pattern), None, None),
             'int':   lambda conf: (r'-?\d+', int, lambda x: str(int(x))),
             'float': lambda conf: (r'-?[\d.]+', float, lambda x: str(float(x))),
-            'path':  lambda conf: (r'.+?', None, None)}
+            'path':  lambda conf: (r'.+?', None, None)
+        }
 
     def add_filter(self, name, func):
         """
@@ -341,9 +402,9 @@ class Router(object):
         """
         self.filters[name] = func
 
-    rule_syntax = re.compile('(\\\\*)'\
-        '(?:(?::([a-zA-Z_][a-zA-Z_0-9]*)?()(?:#(.*?)#)?)'\
-          '|(?:<([a-zA-Z_][a-zA-Z_0-9]*)?(?::([a-zA-Z_]*)'\
+    rule_syntax = re.compile('(\\\\*)'
+        '(?:(?::([a-zA-Z_][a-zA-Z_0-9]*)?()(?:#(.*?)#)?)'
+          '|(?:<([a-zA-Z_][a-zA-Z_0-9]*)?(?::([a-zA-Z_]*)'
             '(?::((?:\\\\.|[^\\\\>]+)+)?)?)?>))')
 
     def _itertokens(self, rule):
@@ -351,7 +412,7 @@ class Router(object):
         for match in self.rule_syntax.finditer(rule):
             prefix += rule[offset:match.start()]
             g = match.groups()
-            if len(g[0])%2: # Escaped wildcard
+            if len(g[0])%2:  # Escaped wildcard
                 prefix += match.group(0)[len(g[0]):]
                 offset = match.end()
                 continue
@@ -525,9 +586,9 @@ class Route(object):
         self.config = ConfigDict().load_dict(config, make_namespaces=True)
 
     def __call__(self, *a, **ka):
-        depr("Some APIs changed to return Route() instances instead of"\
-             " callables. Make sure to use the Route.call method and not to"\
-             " call Route instances directly.") #0.12
+        depr("Some APIs changed to return Route() instances instead of"
+             " callables. Make sure to use the Route.call method and not to"
+             " call Route instances directly.")
         return self.call(*a, **ka)
 
     @cached_property
@@ -575,7 +636,7 @@ class Route(object):
                     callback = plugin.apply(callback, context)
                 else:
                     callback = plugin(callback)
-            except RouteReset: # Try again with changed configuration.
+            except RouteReset:  # Try again with changed configuration.
                 return self._make_callback()
             if not callback is self.callback:
                 update_wrapper(callback, self.callback)
@@ -585,8 +646,8 @@ class Route(object):
         """ Return the callback. If the callback is a decorated function, try to
             recover the original function. """
         func = self.callback
-        func = getattr(func, '__func__' if py3k else 'im_func', func)
-        closure_attr = '__closure__' if py3k else 'func_closure'
+        func = getattr(func, 'im_func', func)
+        closure_attr = 'func_closure'
         while hasattr(func, closure_attr) and getattr(func, closure_attr):
             func = getattr(func, closure_attr)[0].cell_contents
         return func
@@ -613,13 +674,226 @@ class Route(object):
 # http
 # *********************************************************************
 
+class HTTPError(Exception):
+    pass
+
+
+def debug(mode=True):
+    """ Change the debug level.
+    There is only one debug level supported at the moment."""
+    global DEBUG
+    if mode: warnings.simplefilter('default')
+    DEBUG = bool(mode)
+
+
+def http_date(value):
+    if isinstance(value, (datedate, datetime)):
+        value = value.utctimetuple()
+    elif isinstance(value, (int, float)):
+        value = time.gmtime(value)
+    if not isinstance(value, basestring):
+        value = time.strftime("%a, %d %b %Y %H:%M:%S GMT", value)
+    return value
+
+
+def parse_date(ims):
+    """ Parse rfc1123, rfc850 and asctime timestamps and return UTC epoch. """
+    try:
+        ts = email.utils.parsedate_tz(ims)
+        return time.mktime(ts[:8] + (0,)) - (ts[9] or 0) - time.timezone
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+
+
+def parse_auth(header):
+    """ Parse rfc2617 HTTP authentication header string (basic) and return (user,pass) tuple or None"""
+    try:
+        method, data = header.split(None, 1)
+        if method.lower() == 'basic':
+            user, pwd = touni(base64.b64decode(tob(data))).split(':',1)
+            return user, pwd
+    except (KeyError, ValueError):
+        return None
+
+
+def parse_range_header(header, maxlen=0):
+    """ Yield (start, end) ranges parsed from a HTTP Range header. Skip
+        unsatisfiable ranges. The end index is non-inclusive."""
+    if not header or header[:6] != 'bytes=': return
+    ranges = [r.split('-', 1) for r in header[6:].split(',') if '-' in r]
+    for start, end in ranges:
+        try:
+            if not start:  # bytes=-100    -> last 100 bytes
+                start, end = max(0, maxlen-int(end)), maxlen
+            elif not end:  # bytes=100-    -> all but the first 99 bytes
+                start, end = int(start), maxlen
+            else:          # bytes=100-200 -> bytes 100-200 (inclusive)
+                start, end = int(start), min(int(end)+1, maxlen)
+            if 0 <= start < end <= maxlen:
+                yield start, end
+        except ValueError:
+            pass
+
+
+def _parse_qsl(qs):
+    r = []
+    for pair in qs.replace(';','&').split('&'):
+        if not pair: continue
+        nv = pair.split('=', 1)
+        if len(nv) != 2: nv.append('')
+        key = urlunquote(nv[0].replace('+', ' '))
+        value = urlunquote(nv[1].replace('+', ' '))
+        r.append((key, value))
+    return r
+
+
+def _lscmp(a, b):
+    """ Compares two strings in a cryptographically safe way:
+        Runtime is not affected by length of common prefix."""
+    return not sum(0 if x==y else 1 for x, y in zip(a, b)) and len(a) == len(b)
+
+
+def html_escape(string):
+    """ Escape HTML special characters ``&<>`` and quotes ``'"``. """
+    return string.replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')\
+                 .replace('"','&quot;').replace("'",'&#039;')
+
+
+def html_quote(string):
+    """ Escape and quote a string to be used as an HTTP attribute. """
+    return '"%s"' % html_escape(string).replace('\n','&#10;')\
+                    .replace('\r','&#13;').replace('\t','&#9;')
+
+
+def path_shift(script_name, path_info, shift=1):
+    """ Shift path fragments from PATH_INFO to SCRIPT_NAME and vice versa.
+
+        :return: The modified paths.
+        :param script_name: The SCRIPT_NAME path.
+        :param script_name: The PATH_INFO path.
+        :param shift: The number of path fragments to shift. May be negative to
+          change the shift direction. (default: 1)
+    """
+    if shift == 0: return script_name, path_info
+    pathlist = path_info.strip('/').split('/')
+    scriptlist = script_name.strip('/').split('/')
+    if pathlist and pathlist[0] == '': pathlist = []
+    if scriptlist and scriptlist[0] == '': scriptlist = []
+    if shift > 0 and shift <= len(pathlist):
+        moved = pathlist[:shift]
+        scriptlist = scriptlist + moved
+        pathlist = pathlist[shift:]
+    elif shift < 0 and shift >= -len(scriptlist):
+        moved = scriptlist[shift:]
+        pathlist = moved + pathlist
+        scriptlist = scriptlist[:shift]
+    else:
+        empty = 'SCRIPT_NAME' if shift < 0 else 'PATH_INFO'
+        raise AssertionError("Cannot shift. Nothing left from %s" % empty)
+    new_script_name = '/' + '/'.join(scriptlist)
+    new_path_info = '/' + '/'.join(pathlist)
+    if path_info.endswith('/') and pathlist: new_path_info += '/'
+    return new_script_name, new_path_info
+
+
+class MultiDict(DictMixin):
+    """ This dict stores multiple values per key, but behaves exactly like a
+        normal dict in that it returns only the newest value for any given key.
+        There are special methods available to access the full list of values.
+    """
+
+    def __init__(self, *a, **k):
+        self.dict = dict((k, [v]) for (k, v) in dict(*a, **k).items())
+
+    def __len__(self): return len(self.dict)
+    def __iter__(self): return iter(self.dict)
+    def __contains__(self, key): return key in self.dict
+    def __delitem__(self, key): del self.dict[key]
+    def __getitem__(self, key): return self.dict[key][-1]
+    def __setitem__(self, key, value): self.append(key, value)
+    def keys(self): return self.dict.keys()
+    def values(self): return [v[-1] for v in self.dict.values()]
+    def items(self): return [(k, v[-1]) for k, v in self.dict.items()]
+    def iterkeys(self): return self.dict.iterkeys()
+    def itervalues(self): return (v[-1] for v in self.dict.itervalues())
+    def iteritems(self):
+        return ((k, v[-1]) for k, v in self.dict.iteritems())
+    def iterallitems(self):
+        return ((k, v) for k, vl in self.dict.iteritems() for v in vl)
+    def allitems(self):
+        return [(k, v) for k, vl in self.dict.iteritems() for v in vl]
+
+    def get(self, key, default=None, index=-1, type=None):
+        """ Return the most recent value for a key.
+
+            :param default: The default value to be returned if the key is not
+                   present or the type conversion fails.
+            :param index: An index for the list of available values.
+            :param type: If defined, this callable is used to cast the value
+                    into a specific type. Exception are suppressed and result in
+                    the default value to be returned.
+        """
+        try:
+            val = self.dict[key][index]
+            return type(val) if type else val
+        except Exception:
+            pass
+        return default
+
+    def append(self, key, value):
+        """ Add a new value to the list of values for this key. """
+        self.dict.setdefault(key, []).append(value)
+
+    def replace(self, key, value):
+        """ Replace the list of values with a single value. """
+        self.dict[key] = [value]
+
+    def getall(self, key):
+        """ Return a (possibly empty) list of values for a key. """
+        return self.dict.get(key) or []
+
+    # Aliases for WTForms to mimic other multi-dict APIs (Django)
+    getone = get
+    getlist = getall
+
+
+def _hkey(key):
+    if '\n' in key or '\r' in key or '\0' in key:
+        raise ValueError("Header names must not contain control characters: %r" % key)
+    return key.title().replace('_', '-')
+
+
+def _hval(value):
+    value = tonat(value)
+    if '\n' in value or '\r' in value or '\0' in value:
+        raise ValueError("Header value must not contain control characters: %r" % value)
+    return value
+
+
+def local_property(name=None):
+    if name:
+        depr('local_property() is deprecated and will be removed.')
+    ls = threading.local()
+
+    def fget(self):
+        try:
+            return ls.var
+        except AttributeError:
+            raise RuntimeError("Request context not initialized.")
+    def fset(self, value):
+        ls.var = value
+    def fdel(self):
+        del ls.var
+    return property(fget, fset, fdel, 'Thread-local property')
+
+
 class HTTPServer(SocketServer.ThreadingTCPServer):
 
     allow_reuse_address = 1    # Seems to make sense in testing environment
     request_queue_size = 4
 
     def server_bind(self):
-        """Override server_bind to store the server name."""
+        """ Override server_bind to store the server name. """
         SocketServer.TCPServer.server_bind(self)
         host, port = self.socket.getsockname()[:2]
         self.server_name = socket.getfqdn(host)
@@ -761,7 +1035,7 @@ class HTTPRequestHandler(SimpleHTTPRequestHandler):
 
 
 def _file_iter_range(fp, offset, bytes, maxread=1024*1024):
-    """Yield chunks from a range in a file. No chunk is bigger than maxread."""
+    """ Yield chunks from a range in a file. No chunk is bigger than maxread. """
     fp.seek(offset)
     while bytes > 0:
         part = fp.read(min(bytes, maxread))
@@ -770,16 +1044,24 @@ def _file_iter_range(fp, offset, bytes, maxread=1024*1024):
         yield part
 
 
-if __name__ == "__main__":
-    """
-    This runs an HTTP server on port 8000 (or the first command line argument).
-    """
+def handle_commandline():
+    parser = argparse.ArgumentParser(description='Simple HttpServer')
+    parser.add_argument('-b', '--bind',
+                        action='store', dest='host', default=None, metavar='host',
+                        help='host to bind default to 0.0.0.0')
+    parser.add_argument('-p', '--port',
+                        action='store', type=int, dest='port', default=None, metavar='port',
+                        help='port to listen default to 8000')
+    parser.add_argument('-d', '--debug',
+                        action='store_true', dest='debug', default=False,
+                        help='start server debug mode')
+    return vars(parser.parse_args())
 
-    if sys.argv[1:]:
-        port = int(sys.argv[1])
-    else:
-        port = 8000
-    server_address = ('', port)
+
+if __name__ == "__main__":
+    args = handle_commandline()
+    server_address = (args['host'], args['port'])
+    debug = args['debug']
 
     httpd = HTTPServer(server_address, HTTPRequestHandler)
 
